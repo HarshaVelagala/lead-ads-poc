@@ -1,0 +1,11 @@
+{
+  "expo": {
+    "name": "Leads Mobile",
+    "slug": "leads-mobile",
+    "scheme": "leadsmobile",
+    "plugins": ["expo-router"],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

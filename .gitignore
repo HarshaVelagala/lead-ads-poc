@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+backend/.env
+backend/data/
+backend/*.db
+backend/**/*.db
+.pytest_cache/
+
+# Node and Expo
+node_modules/
+mobile/node_modules/
+mobile/.expo/
+mobile/.env
+mobile/dist/
+
+# Local tooling
+.DS_Store
+*.log

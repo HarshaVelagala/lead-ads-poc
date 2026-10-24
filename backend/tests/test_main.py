@@ -6,12 +6,14 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
+from starlette.websockets import WebSocketDisconnect
 
 from app import database as database_module
 from app.database import Base, get_db
 from app.main import app
 from app.models.lead import Lead
 from app.schemas.lead import LeadCreate
+from app.services import auth as auth_service
 from app.services import meta_service
 
 
@@ -36,6 +38,9 @@ def client(monkeypatch):
     monkeypatch.setattr("app.main.initialize_database", lambda: None)
     monkeypatch.setattr(meta_service.config, "META_VERIFY_TOKEN", "verify-me")
     monkeypatch.setattr(meta_service.config, "META_APP_SECRET", "app-secret")
+    monkeypatch.setattr(auth_service.config, "ADMIN_EMAIL", "owner@example.com")
+    monkeypatch.setattr(auth_service.config, "ADMIN_PASSWORD_HASH", auth_service.password_hasher.hash("owner-password"))
+    monkeypatch.setattr(auth_service.config, "JWT_SECRET_KEY", "test-secret-key-that-is-at-least-32-bytes-long")
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
@@ -43,20 +48,73 @@ def client(monkeypatch):
     test_engine.dispose()
 
 
-def test_health_and_lead_crud(client):
+@pytest.fixture
+def auth_token(client):
+    response = client.post(
+        "/auth/login",
+        json={"email": "owner@example.com", "password": "owner-password"},
+    )
+    assert response.status_code == 200
+    return response.json()["access_token"]
+
+
+@pytest.fixture
+def websocket_ticket(client, auth_token):
+    response = client.post(
+        "/auth/ws-ticket",
+        headers={"Authorization": f"Bearer {auth_token}"},
+    )
+    assert response.status_code == 200
+    return response.json()["access_token"]
+
+
+def test_login_rejects_invalid_credentials(client):
+    response = client.post(
+        "/auth/login",
+        json={"email": "owner@example.com", "password": "wrong-password"},
+    )
+    assert response.status_code == 401
+
+
+def test_cors_does_not_allow_arbitrary_origins(client):
+    response = client.options(
+        "/auth/login",
+        headers={
+            "Origin": "https://untrusted.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_authentication_fails_closed_when_not_configured(client, monkeypatch):
+    monkeypatch.setattr(auth_service.config, "ADMIN_PASSWORD_HASH", "")
+    response = client.post(
+        "/auth/login",
+        json={"email": "owner@example.com", "password": "owner-password"},
+    )
+    assert response.status_code == 503
+
+
+def test_health_and_lead_crud(client, auth_token):
+    headers = {"Authorization": f"Bearer {auth_token}"}
     assert client.get("/health").json() == {"status": "ok"}
+    assert client.get("/leads").status_code == 401
+    assert client.get("/leads", headers=headers).status_code == 200
+    assert client.post("/auth/ws-ticket").status_code == 401
     created = client.post(
         "/leads",
         json={"meta_lead_id": "meta-001", "name": "Test Lead", "email": "test@example.com", "phone": "123"},
+        headers=headers,
     )
     assert created.status_code == 201
     lead = created.json()
     assert lead["meta_lead_id"] == "meta-001"
     assert lead["fullName"] == "Test Lead"
     assert lead["mobile_id"] == "meta-001"
-    assert client.get("/leads").json()[0]["email"] == "test@example.com"
-    assert client.get(f"/leads/{lead['id']}").json()["name"] == "Test Lead"
-    assert client.get("/leads/999").status_code == 404
+    assert client.get("/leads", headers=headers).json()[0]["email"] == "test@example.com"
+    assert client.get(f"/leads/{lead['id']}", headers=headers).json()["name"] == "Test Lead"
+    assert client.get("/leads/999", headers=headers).status_code == 404
 
 
 def test_meta_webhook_verification(client):
@@ -69,21 +127,42 @@ def test_meta_webhook_verification(client):
     assert client.get("/webhook/meta", params={"hub.mode": "subscribe", "hub.verify_token": "wrong", "hub.challenge": "1"}).status_code == 403
 
 
-def test_duplicate_meta_lead_is_not_inserted_twice(client):
+def test_duplicate_meta_lead_is_not_inserted_twice(client, auth_token):
     payload = {"meta_lead_id": "duplicate-1", "name": "Same Lead"}
-    first = client.post("/leads", json=payload)
-    second = client.post("/leads", json=payload)
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    first = client.post("/leads", json=payload, headers=headers)
+    second = client.post("/leads", json=payload, headers=headers)
     assert first.status_code == second.status_code == 201
-    assert len(client.get("/leads").json()) == 1
+    assert len(client.get("/leads", headers=headers).json()) == 1
 
 
-def test_websocket_broadcasts_created_lead(client):
-    with client.websocket_connect("/ws/leads") as websocket:
-        response = client.post("/leads", json={"meta_lead_id": "ws-001", "name": "WebSocket Lead"})
+def test_websocket_broadcasts_created_lead(client, auth_token, websocket_ticket):
+    headers = {"Authorization": f"Bearer {auth_token}"}
+    with client.websocket_connect(f"/ws/leads?ticket={websocket_ticket}") as websocket:
+        response = client.post(
+            "/leads",
+            json={"meta_lead_id": "ws-001", "name": "WebSocket Lead"},
+            headers=headers,
+        )
         message = websocket.receive_json()
     assert response.status_code == 201
     assert message["type"] == "new_lead"
     assert message["data"]["meta_lead_id"] == "ws-001"
+
+
+def test_websocket_ticket_cannot_access_leads_api(client, auth_token, websocket_ticket):
+    response = client.get(
+        "/leads",
+        headers={"Authorization": f"Bearer {websocket_ticket}"},
+    )
+    assert response.status_code == 401
+
+
+def test_websocket_rejects_unauthenticated_connection(client):
+    with client.websocket_connect("/ws/leads") as websocket:
+        with pytest.raises(WebSocketDisconnect) as disconnect:
+            websocket.receive_text()
+    assert disconnect.value.code == 4401
 
 
 def test_webhook_signature_and_unexpected_payload(client):
@@ -110,7 +189,12 @@ def test_malformed_webhook_shapes_are_ignored(client):
     assert response.json() == {"received": True}
 
 
-def test_meta_lead_event_fetches_persists_and_broadcasts(client, monkeypatch):
+def test_meta_lead_event_fetches_persists_and_broadcasts(
+    client,
+    monkeypatch,
+    auth_token,
+    websocket_ticket,
+):
     async def fake_fetch_lead(lead_id, form_id=None, page_id=None):
         return LeadCreate(
             meta_lead_id=lead_id,
@@ -127,7 +211,7 @@ def test_meta_lead_event_fetches_persists_and_broadcasts(client, monkeypatch):
         b'"value":{"leadgen_id":"meta-123","form_id":"form-456"}}]}]}'
     )
     signature = "sha256=" + hmac.new(b"app-secret", payload, hashlib.sha256).hexdigest()
-    with client.websocket_connect("/ws/leads") as websocket:
+    with client.websocket_connect(f"/ws/leads?ticket={websocket_ticket}") as websocket:
         response = client.post("/webhook/meta", content=payload, headers={"X-Hub-Signature-256": signature})
         message = websocket.receive_json()
     assert response.status_code == 200
@@ -135,7 +219,10 @@ def test_meta_lead_event_fetches_persists_and_broadcasts(client, monkeypatch):
     assert message["data"]["meta_lead_id"] == "meta-123"
     assert message["data"]["form_id"] == "form-456"
     assert message["data"]["page_id"] == "page-123"
-    assert client.get("/leads").json()[0]["email"] == "meta@example.com"
+    assert client.get(
+        "/leads",
+        headers={"Authorization": f"Bearer {auth_token}"},
+    ).json()[0]["email"] == "meta@example.com"
 
 
 def test_legacy_sqlite_leads_are_migrated(monkeypatch, tmp_path):

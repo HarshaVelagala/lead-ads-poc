@@ -64,9 +64,22 @@ META_PAGE_ID=
 META_API_VERSION=vXX.X
 DATABASE_URL=sqlite:///./leads.db
 PUBLIC_BACKEND_URL=https://your-ngrok-domain.ngrok-free.app
+ADMIN_EMAIL=owner@example.com
+ADMIN_PASSWORD_HASH=
+JWT_SECRET_KEY=
+CORS_ORIGINS=http://localhost:8081,http://127.0.0.1:8081
 ```
 
 Replace `META_API_VERSION` with a currently supported Graph API version shown in Meta's current documentation/dashboard before using Graph API. `vXX.X` is deliberately a placeholder, not an API version. Never put the Meta access token or app secret in the mobile app. The verify token is an arbitrary shared string used only for the initial webhook challenge.
+
+The backend requires a single administrator login before the leads API or WebSocket can be used. Generate an Argon2 password hash and a signing key from `backend/` after installing its requirements:
+
+```powershell
+python -c "import getpass; from pwdlib import PasswordHash; print(PasswordHash.recommended().hash(getpass.getpass('Admin password: ')))"
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Set the results as `ADMIN_PASSWORD_HASH` and `JWT_SECRET_KEY`, and set `ADMIN_EMAIL` to the owner's email. Store these values as local environment variables or hosting-provider secrets; never commit them. Access tokens expire after one hour. The app keeps the token in memory and clears it on sign-out or app restart; it cannot revoke a copied token before its expiry. Set `CORS_ORIGINS` to the exact origins of any hosted web frontend (comma-separated). Native mobile clients do not use browser CORS.
 
 Copy the mobile example into a local environment file and adjust for the target device:
 
@@ -152,6 +165,8 @@ Meta's interface, permissions, review requirements, supported API versions, and 
 
 This backend requires a valid `X-Hub-Signature-256` whenever Meta's app secret is configured; requests are rejected if the secret/signature is missing or invalid. Do not expose the API publicly without setting `META_APP_SECRET`, `META_VERIFY_TOKEN`, and a suitable access token. The Graph API version is intentionally not hard-coded.
 
+`GET /leads`, `GET /leads/{lead_id}`, and `POST /leads` require a bearer token from `POST /auth/login`. The app requests a short-lived WebSocket ticket from `POST /auth/ws-ticket` before connecting to `/ws/leads`. The Meta webhook and health check remain public; webhook POST requests require a valid Meta signature. Configure the administrator email, Argon2 password hash, and JWT signing key on the backend host before deployment.
+
 ## End-to-End Test
 
 1. Fill in backend secrets/configuration and start FastAPI.
@@ -217,7 +232,7 @@ Mention that HTTP loads history, WebSocket handles new arrivals, and the device 
 ## Assumptions and Limitations
 
 - This is a single-process, one-week PoC. WebSocket clients are in process memory; multiple backend workers need a shared pub/sub layer.
-- The unauthenticated `POST /leads` endpoint is intended for local development/demo only; protect or disable it before public deployment.
+- `POST /leads` requires the administrator bearer token, but any authenticated admin can create records; keep the account credentials private.
 - Graph API field names and access requirements depend on the current form configuration and Meta policy. The extractor recognizes common full name, email, and phone field names; adjust it for custom form field keys.
 - Meta webhook delivery is retried by Meta, and lead IDs are idempotent in SQLite. This implementation does not persist a webhook delivery queue or retry Graph API failures asynchronously.
 - App-level FastAPI CORS is permissive for local development. Production deployments should restrict origins and add rate limits/monitoring.

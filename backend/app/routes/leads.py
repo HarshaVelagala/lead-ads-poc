@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.models.lead import Lead
+from app.routes.auth import get_current_admin
 from app.schemas.lead import LeadCreate, LeadRead
 from app.services.websocket_manager import websocket_manager
 
@@ -35,12 +36,19 @@ def _insert_lead(payload: LeadCreate, database: Session) -> tuple[Lead, bool]:
 
 
 @router.get("", response_model=list[LeadRead])
-def list_leads(database: Session = Depends(get_db)) -> list[Lead]:
+def list_leads(
+    database: Session = Depends(get_db),
+    _: str = Depends(get_current_admin),
+) -> list[Lead]:
     return list(database.scalars(select(Lead).order_by(Lead.received_at.desc(), Lead.id.desc())))
 
 
 @router.get("/{lead_id}", response_model=LeadRead)
-def get_lead(lead_id: int, database: Session = Depends(get_db)) -> Lead:
+def get_lead(
+    lead_id: int,
+    database: Session = Depends(get_db),
+    _: str = Depends(get_current_admin),
+) -> Lead:
     lead = database.get(Lead, lead_id)
     if lead is None:
         raise HTTPException(status_code=404, detail="Lead not found")
@@ -48,9 +56,12 @@ def get_lead(lead_id: int, database: Session = Depends(get_db)) -> Lead:
 
 
 @router.post("", response_model=LeadRead, status_code=status.HTTP_201_CREATED)
-async def create_lead(payload: LeadCreate, database: Session = Depends(get_db)) -> Lead:
+async def create_lead(
+    payload: LeadCreate,
+    database: Session = Depends(get_db),
+    _: str = Depends(get_current_admin),
+) -> Lead:
     lead, created = _insert_lead(payload, database)
     if created:
         await websocket_manager.broadcast_lead(LeadRead.model_validate(lead))
     return lead
-
